@@ -1,0 +1,115 @@
+#include "cache.h"
+
+#define maxRRPV 3
+#define NUM_LEADER_SETS 32
+#define LEADER_SET_INTERVAL (L2C_SET / NUM_LEADER_SETS)
+#define THRESHOLD 0.25
+uint32_t l2_rrpv[L2C_SET][L2C_WAY];
+uint64_t instr_access=0;
+uint64_t instr_miss=0;
+uint64_t total_access=0;
+uint64_t total_miss=0;
+
+// initialize replacement state
+void CACHE::l2c_initialize_replacement()
+{
+    cout << "Initialize Dynamic-I-RRIP state for L2C" << endl;
+
+    for (int i=0; i<L2C_SET; i++) {
+        for (int j=0; j<L2C_WAY; j++) {
+            l2_rrpv[i][j] = maxRRPV;
+        }
+    }
+}
+
+// find replacement victim
+uint32_t CACHE::l2c_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set, const BLOCK *current_set, uint64_t ip, uint64_t full_addr, uint32_t type)
+{
+    bool isLeader=((set%LEADER_SET_INTERVAL)==0);//checks if current set is leader set
+    bool isIrrip=false;//to check if we should do irrip or rrip
+    if(total_access+total_miss!=0) isIrrip=((instr_access*1.0+instr_miss*1.0)/(total_access*1.0+total_miss*1.0)>THRESHOLD);
+
+    // look for the maxRRPV line 
+    
+    while (1)
+    {
+        if(!isLeader&&isIrrip){//if not leader and isIrrip is true, do irrip eviction
+        
+        for (int i=0; i<L2C_WAY; i++)
+            if (l2_rrpv[set][i] == maxRRPV && current_set[i].instruction == 0) //we should evict data blocks first then instruction blocks
+                return i;}
+
+        for (int i=0; i<L2C_WAY; i++)
+            if (l2_rrpv[set][i] == maxRRPV)
+                return i;
+
+        for (int i=0; i<L2C_WAY; i++)
+            l2_rrpv[set][i]++;//if there is no rrpv=3, we increment the rrpv for all, until one rrpv=3 block is found
+    }
+
+    // WE SHOULD NOT REACH HERE
+    assert(0);
+    return 0;
+}
+
+// called on every cache hit and cache fill
+void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t way, uint64_t full_addr, uint64_t ip, uint64_t victim_addr, uint32_t type, uint8_t hit, uint8_t isInstruction)
+{
+    bool isLeader=((set%LEADER_SET_INTERVAL)==0);//checks if current set is leader set
+    bool isIrrip=false;//to check if we should do irrip or rrip
+    if(total_access+total_miss!=0) isIrrip=((instr_access*1.0+instr_miss*1.0)/(total_access*1.0+total_miss*1.0)>THRESHOLD);
+    if(isLeader){   //updating the access and miss counts if it is leader set
+        total_access++;
+        if(isInstruction)instr_access++;
+        if(!hit){
+            total_miss++;
+            if(isInstruction)instr_miss++;
+        }
+    }
+
+    string TYPE_NAME;
+    if (type == LOAD)
+        TYPE_NAME = "LOAD";
+    else if (type == RFO)
+        TYPE_NAME = "RFO";
+    else if (type == PREFETCH)
+        TYPE_NAME = "PF";
+    else if (type == WRITEBACK)
+        TYPE_NAME = "WB";
+    else if (type == LOAD_TRANSLATION)
+	TYPE_NAME = "L_TN";
+    else if (type == PREFETCH_TRANSLATION)
+	TYPE_NAME = "P_TN";
+    else if (type == TRANSLATION_FROM_L1D)
+	TYPE_NAME = "TN_L1D";
+    else
+        assert(0);
+
+    if (hit)
+        TYPE_NAME += "_HIT";
+    else
+        TYPE_NAME += "_MISS";
+
+    if ((type == WRITEBACK) && ip)
+        assert(0);
+
+    // uncomment this line to see the L2C accesses
+    // cout << "CPU: " << cpu << "  L2C " << setw(9) << TYPE_NAME << " set: " << setw(5) << set << " way: " << setw(2) << way;
+    // cout << hex << " paddr: " << setw(12) << paddr << " ip: " << setw(8) << ip << " victim_addr: " << victim_addr << dec << endl;
+
+    if (hit)
+        l2_rrpv[set][way] = 0;
+    else
+    {
+        if (isInstruction&&!isLeader&&isIrrip)
+            l2_rrpv[set][way] = maxRRPV-2;//we would want the instructions to stay in the cache for longer, hence place3 at rrpv=1
+        else
+            l2_rrpv[set][way] = maxRRPV - 1;//for data blocks we would keep it as usual
+    }
+}
+
+// use this function to print out your own stats at the end of simulation
+void CACHE::l2c_replacement_final_stats()
+{
+
+}
