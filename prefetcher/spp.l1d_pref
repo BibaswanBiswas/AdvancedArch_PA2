@@ -1,24 +1,209 @@
 #include "cache.h"
-
-
-void CACHE::l1d_prefetcher_initialize() 
-{
-    std::cout << "------------------------------------------------" << std::endl;
-    std::cout << "        Stride Pattern Prefetcher (SPP)         " << std::endl;
-    std::cout << "------------------------------------------------" << std::endl;
+#include <iostream>
+#include <cmath>
+ 
+//SPP Configuration Parameters
+constexpr int MAX_DEGREE = 5;               // Maximum number of prefetches to issue
+constexpr int MIN_DEGREE = 1;               // Minimum number of prefetches to issue
+constexpr uint32_t TRACKER_SETS = 256;      //Number of sets in the IP Tracker table
+constexpr uint32_t TRACKER_WAYS = 4;        // Associativity of the IP Tracker table
+constexpr uint32_t PATTERN_TABLE_SIZE = 4096; //Number of entries in the Pattern Table
+constexpr uint32_t TRACKER_SIZE = 4096;     //Size of the recent prefetch tracker for accuracy measurement
+ 
+//Scaling Thresholds for degree adjustment
+constexpr double ACCURACY_HIGH = 50.0;      // Accuracy percentage threshold to increase prefetch degree
+constexpr double ACCURACY_LOW = 25.0;       // Accuracy percentage threshold to decrease prefetch degree
+ 
+//Tracks the history and confidence of individual instruction pointers
+struct IP_Tracker {
+    uint64_t tag = 0;               // Tag to identify the specific IP
+    uint64_t last_block_addr = 0;   // The cache block address last accessed by this IP
+    int64_t last_stride = 0;        // The stride observed in the previous access
+    int64_t last_last_stride = 0;   // The stride observed two accesses ago
+    int confidence = 0;             // Confidence counter for uniform strides
+    uint64_t last_used = 0;         // Timestamp for LRU replacement policy
+    bool valid = false;             // Indicates if the entry contains valid data
+};
+ 
+//Stores the next expected stride for a given history signature
+struct Pattern_Entry {
+    uint32_t tag = 0;               //Signature matching the stride history
+    int64_t next_stride = 0;        //The predicted next stride
+};
+ 
+// Hardware tables simulating the prefetcher state
+IP_Tracker ip_table[TRACKER_SETS][TRACKER_WAYS]; //Set-associative table to track IPs
+Pattern_Entry pattern_table[PATTERN_TABLE_SIZE]; //Direct-mapped table for complex stride patterns
+ 
+// Circular buffer/hash map to track recently issued prefetches for accuracy calculation
+uint64_t recent_prefetches[TRACKER_SIZE] = {0};
+ 
+// Global statistics and state variables
+uint64_t prefetches_issued = 0;     // Number of prefetches issued in the current epoch
+uint64_t useful_prefetches = 0;     // Number of prefetches that were actually used
+uint64_t l1d_load_count = 0;        // Total L1D loads processed
+int current_degree = 2;             // Current adaptive prefetch degree
+uint64_t spp_cycle = 0;             // Internal cycle counter for LRU management
+ 
+void CACHE::l1d_prefetcher_initialize() {
+    cout << "CPU " << cpu << " L1D stride pattern prefetcher" << endl;
 }
-
-void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type, uint8_t critical_ip_flag)
-{
-   
+ 
+void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type, uint8_t critical_ip_flag) {
+    // Only train and prefetch on LOAD instructions
+    if (type != LOAD) return;
+    spp_cycle++;
+    l1d_load_count++;
+    
+    uint64_t block_addr = addr >> 6; // Convert byte address to cache block address (assuming 64B lines)
+    
+    // Hash the IP to find the set index, and use the IP itself as the tag
+    uint32_t set_index = (ip ^ (ip >> 4)) % TRACKER_SETS;
+    uint64_t ip_tag = ip;
+ 
+    // Accuracy Tracker (Check if the current demand load hits a recently prefetched block)
+    uint32_t track_idx = block_addr % TRACKER_SIZE;
+    if (recent_prefetches[track_idx] == block_addr) {
+        useful_prefetches++;
+        recent_prefetches[track_idx] = 0; // Clear entry to prevent double-counting
+    }
+ 
+    // Evaluate Throttling strictly based on CPU activity (Every 512 loads)
+    if (l1d_load_count % 512 == 0) {
+        if (prefetches_issued > 0) {
+            double accuracy = ((double)useful_prefetches / prefetches_issued) * 100;
+            
+            // Adapt the prefetch degree based on recent accuracy thresholds
+            if (accuracy >= ACCURACY_HIGH && current_degree < MAX_DEGREE) current_degree++;
+            else if (accuracy <= ACCURACY_LOW && current_degree > MIN_DEGREE) current_degree--;
+        }
+        // Reset counters for the next epoch
+        prefetches_issued = 0;
+        useful_prefetches = 0;
+    }
+ 
+    // IP Table Lookup (Search for a matching IP or find the LRU victim)
+    int way = -1;
+    int lru_way = 0;
+    uint64_t oldest_time = static_cast<uint64_t>(-1);
+ 
+    for (int i = 0; i < TRACKER_WAYS; i++) {
+        // Hit in the IP table
+        if (ip_table[set_index][i].valid && ip_table[set_index][i].tag == ip_tag) {
+            way = i;
+            break;
+        }
+        // Track the first invalid entry or the least recently used (LRU) entry
+        if (!ip_table[set_index][i].valid) {
+            lru_way = i;
+            oldest_time = 0;
+        } else if (ip_table[set_index][i].last_used < oldest_time) {
+            oldest_time = ip_table[set_index][i].last_used;
+            lru_way = i;
+        }
+    }
+ 
+    // IP Miss (Allocate a new entry in the LRU way)
+    if (way == -1) {
+        way = lru_way;
+        ip_table[set_index][way].valid = true;
+        ip_table[set_index][way].tag = ip_tag;
+        ip_table[set_index][way].last_block_addr = block_addr;
+        ip_table[set_index][way].last_stride = 0;
+        ip_table[set_index][way].last_last_stride = 0;
+        ip_table[set_index][way].confidence = 0;
+        ip_table[set_index][way].last_used = spp_cycle;
+        return; // Need more history to prefetch, exit early
+    }
+ 
+    // IP Hit (Update LRU timestamp and calculate current stride)
+    ip_table[set_index][way].last_used = spp_cycle;
+    int64_t current_stride = block_addr - ip_table[set_index][way].last_block_addr;
+    
+    // Ignore spatial locality hits (stride 0) and massive cross-page jumps (stride >= 64 blocks)
+    if (current_stride == 0 || std::abs(current_stride) >= 64) {
+        ip_table[set_index][way].last_block_addr = block_addr;
+        return; 
+    }
+ 
+    // Train Pattern Table using a perfect 14-bit bijection signature
+    if (ip_table[set_index][way].last_last_stride != 0 && ip_table[set_index][way].last_stride != 0) {
+        // Create a 14-bit signature by concatenating the lower 7 bits of the last two strides
+        uint32_t train_sig = ((ip_table[set_index][way].last_last_stride & 0x7F) << 7) | (ip_table[set_index][way].last_stride & 0x7F);
+        uint32_t pt_index = train_sig % PATTERN_TABLE_SIZE;
+        
+        // Instant replacement ensures high agility to phase changes
+        pattern_table[pt_index].tag = train_sig;
+        pattern_table[pt_index].next_stride = current_stride;
+    }
+ 
+    // Uniform classification update
+    // If the stride is consistent, increase confidence. Otherwise, reset confidence.
+    if (current_stride == ip_table[set_index][way].last_stride) {
+        if (ip_table[set_index][way].confidence < 3) ip_table[set_index][way].confidence++;
+    } else {
+        ip_table[set_index][way].confidence = 0; 
+    }
+ 
+    // Predict & Issue (Dual Chained Lookahead)
+    uint64_t pf_block = block_addr;
+    int64_t sim_s1 = ip_table[set_index][way].last_stride;
+    int64_t sim_s2 = current_stride;
+ 
+    // Loop to issue prefetches up to the current adaptive degree
+    for (int i = 0; i < current_degree; i++) {
+        int64_t prefetch_stride = 0;
+ 
+        // Prioritize Uniform Stride (Confidence >= 1 allows fast lock-on)
+        if (ip_table[set_index][way].confidence >= 1) {
+            prefetch_stride = ip_table[set_index][way].last_stride;
+        } else {
+            // Non-Uniform Signature Match (Lookup pattern table for the next stride)
+            uint32_t look_sig = ((sim_s1 & 0x7F) << 7) | (sim_s2 & 0x7F);
+            uint32_t pt_index = look_sig % PATTERN_TABLE_SIZE;
+ 
+            if (pattern_table[pt_index].tag == look_sig) {
+                prefetch_stride = pattern_table[pt_index].next_stride;
+            } else {
+                break; // Sequence broken or pattern unknown, stop issuing
+            }
+        }
+ 
+        // If no stride could be determined, abort prefetching for this chain
+        if (prefetch_stride == 0) break;
+ 
+        // Calculate the target prefetch block and byte address
+        pf_block += prefetch_stride;
+        uint64_t pf_byte_addr = pf_block << 6;
+ 
+        // Enforce Assignment Constraint (Do not cross OS page boundary)
+        if ((addr >> 12) != (pf_byte_addr >> 12)) break;
+ 
+        // Issue the prefetch request to the memory system
+        bool issued = prefetch_line(ip, addr, pf_byte_addr, true, 0);
+        if (issued) {
+            prefetches_issued++;
+            // Track the issued prefetch for future accuracy evaluation
+            recent_prefetches[pf_block % TRACKER_SIZE] = pf_block;
+        }
+ 
+        // Advance simulation window for chained lookahead
+        sim_s1 = sim_s2;
+        sim_s2 = prefetch_stride;
+    }
+ 
+    // Shift History for the next access by this IP
+    ip_table[set_index][way].last_last_stride = ip_table[set_index][way].last_stride;
+    ip_table[set_index][way].last_stride = current_stride;
+    ip_table[set_index][way].last_block_addr = block_addr;
 }
-
+ 
 void CACHE::l1d_prefetcher_cache_fill(uint64_t v_addr, uint64_t addr, uint32_t set, uint32_t way, uint8_t prefetch, uint64_t v_evicted_addr, uint64_t evicted_addr, uint32_t metadata_in)
 {
-	return; //metadata_in;
+return; //metadata_in;
 }
-
+ 
 void CACHE::l1d_prefetcher_final_stats()
 {
-
+ 
 }
