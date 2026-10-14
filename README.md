@@ -1,3 +1,7 @@
+# Navigating the Directory
+
+The Results of the binaries on the traces are in the ./config_reports directory.
+
 # ChampSim
 
 ChampSim is a trace-based simulator for microarchitecture research.
