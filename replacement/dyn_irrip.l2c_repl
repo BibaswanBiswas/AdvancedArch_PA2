@@ -33,6 +33,9 @@ uint32_t CACHE::l2c_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set, c
     
     while (1)
     {
+        for(int i=0;i<L2C_WAY;i++){
+            if(l2_rrpv[set][i]==maxRRPV&&current_set[i].prefetch&&!current_set[i].used)return i;//if it is unused prefetch block it should be the most priority to get evicted.
+        }
         if(!isLeader&&isIrrip){//if not leader and isIrrip is true, do irrip eviction
         
         for (int i=0; i<L2C_WAY; i++)
@@ -58,7 +61,7 @@ void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t wa
     bool isLeader=((set%LEADER_SET_INTERVAL)==0);//checks if current set is leader set
     bool isIrrip=false;//to check if we should do irrip or rrip
     if(total_access+total_miss!=0) isIrrip=((instr_access*1.0+instr_miss*1.0)/(total_access*1.0+total_miss*1.0)>THRESHOLD);
-    if(isLeader){   //updating the access and miss counts if it is leader set
+    if(isLeader && type!=PREFETCH){   //updating the access and miss counts if it is leader set , but not a prefteched block, so as to prevent the distortion due to prefetch blocks
         total_access++;
         if(isInstruction)instr_access++;
         if(!hit){
@@ -101,9 +104,11 @@ void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t wa
         l2_rrpv[set][way] = 0;
     else
     {
-        if (isInstruction&&!isLeader&&isIrrip)
+        if(type==PREFETCH){
+            l2_rrpv[set][way] = maxRRPV;//prefetch blocks are more likely to be unused, hence less priority
+        }else if (isInstruction&&!isLeader&&isIrrip){
             l2_rrpv[set][way] = maxRRPV-2;//we would want the instructions to stay in the cache for longer, hence place3 at rrpv=1
-        else
+        }else
             l2_rrpv[set][way] = maxRRPV - 1;//for data blocks we would keep it as usual
     }
 }
